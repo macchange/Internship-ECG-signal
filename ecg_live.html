@@ -1,0 +1,398 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ECG en direct</title>
+<!-- Inclusion de SheetJS pour la génération du fichier Excel -->
+<script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
+<style>
+  :root { --bg:#0b0f14; --panel:#121923; --line:#223044; --txt:#d7e2ee; --mut:#7d8ea3; --green:#39ff7a; --red:#ff4d5e; --blue:#5aa9ff; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--txt); font:15px/1.4 system-ui, "Segoe UI", sans-serif; }
+  header { display:flex; gap:16px; align-items:center; padding:12px 18px; border-bottom:1px solid var(--line); flex-wrap:wrap; }
+  h1 { font-size:18px; margin:0; font-weight:600; }
+  button { background:#1b6ef3; color:#fff; border:0; border-radius:8px; padding:9px 18px; font-size:15px; cursor:pointer; }
+  button:disabled { background:#33425a; cursor:default; }
+  button.rec { background:#e03e3e; }
+  button.rec:disabled { background:#5a2323; cursor:default; }
+  #status { color:var(--mut); }
+  main { padding:14px 18px; display:grid; gap:14px; grid-template-columns: 1fr 220px; }
+  @media (max-width: 800px) { main { grid-template-columns: 1fr; } }
+  .panel { background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:10px; }
+  .panel h2 { margin:0 0 6px 4px; font-size:13px; font-weight:500; color:var(--mut); text-transform:uppercase; letter-spacing:.06em; }
+  canvas { width:100%; display:block; border-radius:6px; background:#05080c; }
+  #cvF { height:340px; } #cvR { height:130px; }
+  .side { display:flex; flex-direction:column; gap:14px; }
+  .bpm { text-align:center; padding:18px 8px; }
+  .bpm .val { font-size:72px; font-weight:700; line-height:1; color:var(--green); font-variant-numeric: tabular-nums; }
+  .bpm .unit { color:var(--mut); margin-top:4px; }
+  .heart { display:inline-block; font-size:30px; color:var(--red); transform:scale(1); transition:transform .08s; }
+  .heart.beat { transform:scale(1.35); }
+  dl { margin:0; display:grid; grid-template-columns:auto auto; gap:6px 10px; font-size:14px; }
+  dt { color:var(--mut); } dd { margin:0; text-align:right; font-variant-numeric: tabular-nums; }
+  .note { color:var(--mut); font-size:12.5px; padding:0 4px 4px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>ECG en direct</h1>
+  <button id="btn">Connecter l'ESP32</button>
+  <button id="btnRec" class="rec" disabled>Enregistrer (10s)</button>
+  <span id="status">Non connecté</span>
+</header>
+<main>
+  <div class="left" style="display:grid; gap:14px;">
+    <div class="panel"><h2>Signal filtré (0,67 – 28 Hz, redresse &amp; lisse)</h2><canvas id="cvF"></canvas></div>
+    <div class="panel"><h2>Signal brut (sortie LM324N sur GPIO2)</h2><canvas id="cvR"></canvas></div>
+  </div>
+  <div class="side">
+    <div class="panel bpm">
+      <div class="heart" id="heart">&#10084;</div>
+      <div class="val" id="bpm">--</div>
+      <div class="unit">battements / minute</div>
+    </div>
+    <div class="panel">
+      <h2>Mesures</h2>
+      <dl>
+        <dt>Intervalle R-R</dt><dd id="rr">--</dd>
+        <dt>QRS détectés</dt><dd id="nq">--</dd>
+        <dt>Amplitude QRS</dt><dd id="amp">--</dd>
+        <dt>Paquets perdus</dt><dd id="lost">0</dd>
+        <dt>Cadence reçue</dt><dd id="rate">--</dd>
+      </dl>
+      <p class="note" id="msg">Le rythme s'affiche après ~5 s de signal propre.</p>
+    </div>
+  </div>
+</main>
+
+<script>
+// ==== DSP & FILTRAGE OPTIMISÉ ====
+const FS = 250; // 250 Hz
+
+class Biquad {
+  constructor(b0, b1, b2, a0, a1, a2) {
+    this.b0 = b0 / a0; this.b1 = b1 / a0; this.b2 = b2 / a0;
+    this.a1 = a1 / a0; this.a2 = a2 / a0;
+    this.z1 = 0; this.z2 = 0;
+  }
+  process(x) {
+    const y = this.b0 * x + this.z1;
+    this.z1 = this.b1 * x - this.a1 * y + this.z2;
+    this.z2 = this.b2 * x - this.a2 * y;
+    return y;
+  }
+  prime(x) {
+    const g = (this.b0 + this.b1 + this.b2) / (1 + this.a1 + this.a2);
+    const y = g * x;
+    this.z2 = this.b2 * x - this.a2 * y;
+    this.z1 = this.b1 * x - this.a1 * y + this.z2;
+    return y;
+  }
+}
+
+function notch(f0, Q, fs) {
+  const w = 2 * Math.PI * f0 / fs, c = Math.cos(w), al = Math.sin(w) / (2 * Q);
+  return new Biquad(1, -2 * c, 1, 1 + al, -2 * c, 1 - al);
+}
+function lowpass(f0, fs, Q = Math.SQRT1_2) {
+  const w = 2 * Math.PI * f0 / fs, c = Math.cos(w), al = Math.sin(w) / (2 * Q);
+  return new Biquad((1 - c) / 2, 1 - c, (1 - c) / 2, 1 + al, -2 * c, 1 - al);
+}
+function highpass(f0, fs, Q = Math.SQRT1_2) {
+  const w = 2 * Math.PI * f0 / fs, c = Math.cos(w), al = Math.sin(w) / (2 * Q);
+  return new Biquad((1 + c) / 2, -(1 + c), (1 + c) / 2, 1 + al, -2 * c, 1 - al);
+}
+
+class ECGFilter {
+  constructor(fs = FS) {
+    this.n50 = notch(50, 35, fs);
+    this.n100 = notch(100, 35, fs);
+    this.hp = highpass(0.67, fs);    // Supprime la dérive
+    this.lp1 = lowpass(28, fs);     // Supprime les dents de scie
+    this.lp2 = lowpass(28, fs);
+    this.ready = false;
+  }
+  process(x) {
+    if (!this.ready) {
+      let v = x;
+      v = this.n50.prime(v); v = this.n100.prime(v);
+      v = this.hp.prime(v);  v = this.lp1.prime(v); v = this.lp2.prime(v);
+      this.ready = true;
+    }
+    let v = x;
+    v = this.n50.process(v); v = this.n100.process(v);
+    v = this.hp.process(v);  v = this.lp1.process(v); v = this.lp2.process(v);
+    return v;
+  }
+}
+
+function median(a) {
+  const b = Array.from(a).sort((p, q) => p - q), n = b.length;
+  return n ? (n % 2 ? b[(n - 1) / 2] : (b[n / 2 - 1] + b[n / 2]) / 2) : NaN;
+}
+
+function detectBeats(y, fs = FS) {
+  const n = y.length, edge = Math.round(0.15 * fs);
+  const absY = new Float32Array(n);
+  for (let i = 0; i < n; i++) absY[i] = Math.abs(y[i]);
+  const sigma = 1.4826 * median(absY);
+  const thr = 3.8 * sigma;
+  const peaks = [];
+  let i = edge;
+  while (i < n - edge) {
+    if (absY[i] > thr) {
+      let best = i, end = Math.min(n - edge, i + Math.round(0.15 * fs));
+      for (let j = i; j < end; j++) if (absY[j] > absY[best]) best = j;
+      peaks.push(best);
+      i = best + Math.round(0.4 * fs);
+    } else i++;
+  }
+  if (peaks.length < 4) return { bpm: null, peaks, sigma };
+  const rr = [];
+  for (let k = 1; k < peaks.length; k++) rr.push((peaks[k] - peaks[k - 1]) / fs);
+  const med = median(rr);
+  const mad = median(rr.map(v => Math.abs(v - med)));
+  const ok = med > 0.3 && med < 2 && mad / med < 0.15;
+  return { bpm: ok ? 60 / med : null, peaks, sigma, rr, med, mad };
+}
+
+// ---------------------------------------------------------------- BLE Acquisition & Enregistrements Multiples
+const SERVICE_UUID = '4fafc201-1fb5-459e-8fcc-c5c9c331914b';
+const CHAR_UUID    = 'beb5483e-36e1-4688-b7f5-ea07361b26a8';
+const WINDOW_S = 8;
+const N = FS * WINDOW_S;
+const MIN_ANALYSIS_S = 4;
+
+const $ = id => document.getElementById(id);
+const rawBuf = new Float32Array(N), fltBuf = new Float32Array(N);
+let filled = 0, total = 0, lastSeq = null, lost = 0, lastVal = 0;
+let filt = new ECGFilter();
+let lastBeatShown = -1, yLim = 300;
+let rateCount = 0, rateT0 = performance.now(), rateVal = 0;
+
+// Variables pour enregistrements multiples
+let isRecording = false;
+let recordBuffer = [];
+let recordStartTime = 0;
+let recordIndex = 1; // Compteur de sessions d'enregistrement
+
+function pushSample(mv) {
+  // INVERSION DE POLARITÉ : Redresse les pics QRS vers le haut
+  const mvInverted = 3300 - mv; 
+  
+  rawBuf.copyWithin(0, 1); rawBuf[N - 1] = mvInverted;
+  const y = filt.process(mvInverted);
+  fltBuf.copyWithin(0, 1); fltBuf[N - 1] = y;
+  if (filled < N) filled++;
+  total++; rateCount++; lastVal = mvInverted;
+
+  // Enregistrement des données si actif
+  if (isRecording) {
+    const elapsed = (performance.now() - recordStartTime) / 1000;
+    if (elapsed <= 10) {
+      recordBuffer.push({
+        "Temps (s)": Number(elapsed.toFixed(3)),
+        "Brut (mV)": Number(mvInverted.toFixed(2)),
+        "Filtré (mV)": Number(y.toFixed(2))
+      });
+      $('btnRec').textContent = `Enregistrement #${recordIndex}... (${(10 - elapsed).toFixed(1)}s)`;
+    } else {
+      stopRecording();
+    }
+  }
+}
+
+function startRecording() {
+  if (!device || !device.gatt.connected || isRecording) return;
+  isRecording = true;
+  recordBuffer = [];
+  recordStartTime = performance.now();
+  $('btnRec').disabled = true;
+}
+
+function stopRecording() {
+  isRecording = false;
+  $('btnRec').textContent = 'Exportation...';
+  
+  // Génération du fichier Excel horodaté / numéroté
+  const ws = XLSX.utils.json_to_sheet(recordBuffer);
+  const wb = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb, ws, `ECG_Session_${recordIndex}`);
+  XLSX.writeFile(wb, `ecg_data_${recordIndex}.xlsx`);
+
+  // Incrémentation pour la prochaine session
+  recordIndex++;
+  $('btnRec').textContent = 'Enregistrer (10s)';
+  $('btnRec').disabled = false;
+}
+
+$('btnRec').addEventListener('click', startRecording);
+
+let recvPackets = 0;
+function onData(ev) {
+  const dv = ev.target.value;
+  if (dv.byteLength < 4) return;
+  const seq = dv.getUint16(0, true);
+  const n = (dv.byteLength - 2) >> 1;
+  const first = dv.getUint16(2, true) / 10;
+  recvPackets++;
+  if (lastSeq !== null) {
+    const missed = (seq - lastSeq - 1) & 0xFFFF;
+    if (missed > 0 && missed < 50) {
+      lost += missed;
+      const gap = missed * n;
+      const v0 = lastVal;
+      for (let m = 1; m <= gap; m++) pushSample(v0 + (first - v0) * m / (gap + 1));
+    }
+  }
+  lastSeq = seq;
+  for (let i = 0; i < n; i++) pushSample(dv.getUint16(2 + 2 * i, true) / 10);
+}
+
+let device = null;
+async function connect() {
+  try {
+    $('status').textContent = 'Recherche...';
+    device = await navigator.bluetooth.requestDevice({
+      acceptAllDevices: true, optionalServices: [SERVICE_UUID]
+    });
+    device.addEventListener('gattserverdisconnected', () => {
+      $('status').textContent = 'Déconnecté';
+      $('btn').disabled = false; $('btn').textContent = 'Reconnecter';
+      $('btnRec').disabled = true;
+      if (isRecording) stopRecording();
+    });
+    $('status').textContent = 'Connexion...';
+    const server = await device.gatt.connect();
+    const service = await server.getPrimaryService(SERVICE_UUID);
+    const ch = await service.getCharacteristic(CHAR_UUID);
+    filt = new ECGFilter(); filled = 0; total = 0; lastSeq = null; lost = 0; recvPackets = 0;
+    lastBeatShown = -1; rawBuf.fill(0); fltBuf.fill(0);
+    ch.addEventListener('characteristicvaluechanged', onData);
+    await ch.startNotifications();
+    $('status').textContent = 'Connecté : ' + (device.name || 'ESP32');
+    $('btn').disabled = true;
+    $('btnRec').disabled = false;
+  } catch (e) {
+    $('status').textContent = 'Erreur : ' + e.message;
+  }
+}
+$('btn').addEventListener('click', () => {
+  if (!navigator.bluetooth) {
+    $('status').textContent = 'Web Bluetooth indisponible : utiliser Chrome ou Edge.';
+    return;
+  }
+  connect();
+});
+
+// ---------------------------------------------------------------- Affichage
+function setupCanvas(c) {
+  const r = c.getBoundingClientRect(), d = window.devicePixelRatio || 1;
+  if (c.width !== Math.round(r.width * d) || c.height !== Math.round(r.height * d)) {
+    c.width = Math.round(r.width * d); c.height = Math.round(r.height * d);
+  }
+  const g = c.getContext('2d'); g.setTransform(d, 0, 0, d, 0, 0);
+  return { g, w: r.width, h: r.height };
+}
+
+function drawTrace(canvas, buf, color, lo, hi, unitLabel, peaks) {
+  const { g, w, h } = setupCanvas(canvas);
+  g.clearRect(0, 0, w, h);
+  const padL = 46, pw = w - padL - 6;
+  g.font = '11px system-ui'; g.fillStyle = '#7d8ea3'; g.strokeStyle = '#16212e'; g.lineWidth = 1;
+  
+  for (let s = 0; s <= WINDOW_S; s++) {
+    const x = padL + pw * s / WINDOW_S;
+    g.beginPath(); g.moveTo(x, 0); g.lineTo(x, h); g.stroke();
+    if (s < WINDOW_S) g.fillText('-' + (WINDOW_S - s) + ' s', x + 3, h - 4);
+  }
+  for (let k = 0; k <= 4; k++) {
+    const y = h * k / 4, v = hi - (hi - lo) * k / 4;
+    g.beginPath(); g.moveTo(padL, y); g.lineTo(w, y); g.stroke();
+    g.fillText(v.toFixed(0), 4, Math.min(h - 14, Math.max(11, y + 4)));
+  }
+  g.fillText(unitLabel, 4, h - 4);
+
+  g.strokeStyle = color; g.lineWidth = 1.6; g.beginPath();
+  const start = N - filled;
+  for (let i = start; i < N; i++) {
+    const x = padL + pw * i / (N - 1);
+    const y = h - (buf[i] - lo) / (hi - lo) * h;
+    if (i === start) g.moveTo(x, y); else g.lineTo(x, y);
+  }
+  g.stroke();
+  
+  if (peaks) {
+    g.fillStyle = '#ff4d5e';
+    for (const p of peaks) {
+      const x = padL + pw * (p + (N - Math.min(filled, N))) / (N - 1);
+      g.beginPath(); g.arc(x, 8, 3.5, 0, 7); g.fill();
+    }
+  }
+}
+
+let lastAnalysis = { bpm: null, peaks: [] }, lastAnalysisT = 0;
+function analyse() {
+  const settle = 2 * FS;
+  const usable = filled - settle;
+  if (usable < MIN_ANALYSIS_S * FS) { lastAnalysis = { bpm: null, peaks: [] }; return; }
+  const seg = fltBuf.subarray(N - usable);
+  const r = detectBeats(seg);
+  lastAnalysis = { ...r, offset: N - usable };
+}
+
+function frame(t) {
+  requestAnimationFrame(frame);
+  if (t - lastAnalysisT > 500) { lastAnalysisT = t; analyse(); updateReadouts(t); }
+
+  const recent = fltBuf.subarray(N - Math.min(filled, N));
+  if (recent.length > FS) {
+    const a = Array.from(recent, Math.abs).sort((p, q) => p - q);
+    const target = Math.max(50, a[Math.floor(a.length * 0.995)] * 1.3);
+    yLim += (target - yLim) * 0.05;
+  }
+  const peaks = (lastAnalysis.peaks || []).map(p => p + (lastAnalysis.offset || 0) - (N - Math.min(filled, N)));
+  drawTrace($('cvF'), fltBuf, '#39ff7a', -yLim, yLim, 'mV', peaks);
+
+  const rr = rawBuf.subarray(N - Math.min(filled, N));
+  let mn = 1e9, mx = -1e9;
+  for (const v of rr) { if (v < mn) mn = v; if (v > mx) mx = v; }
+  if (!(mx > mn)) { mn = 0; mx = 3300; }
+  const m = (mx - mn) * 0.1 + 20;
+  drawTrace($('cvR'), rawBuf, '#5aa9ff', mn - m, mx + m, 'mV', null);
+}
+
+function updateReadouts(t) {
+  const a = lastAnalysis;
+  const lossy = lost > 0 && lost / (lost + recvPackets) > 0.05;
+  $('bpm').textContent = a.bpm && !lossy ? Math.round(a.bpm) : '--';
+  $('rr').textContent = a.bpm ? (a.med * 1000).toFixed(0) + ' ms' : '--';
+  $('nq').textContent = a.peaks && a.peaks.length ? a.peaks.length : '--';
+  if (a.peaks && a.peaks.length) {
+    const seg = fltBuf.subarray(a.offset);
+    const amps = a.peaks.map(p => Math.abs(seg[p]));
+    $('amp').textContent = median(amps).toFixed(0) + ' mV';
+  } else $('amp').textContent = '--';
+  $('lost').textContent = lost;
+  const dt = (t - rateT0) / 1000;
+  if (dt > 2) { rateVal = rateCount / dt; rateCount = 0; rateT0 = t; }
+  $('rate').textContent = rateVal ? rateVal.toFixed(0) + ' Hz' : '--';
+  const msg = $('msg');
+  if (filled < (MIN_ANALYSIS_S + 2) * FS) msg.textContent = filled ? 'Stabilisation du filtre...' : "Le rythme s'affiche après ~5 s de signal propre.";
+  else if (lost > 0 && lost / (lost + recvPackets) > 0.02) msg.textContent = 'Paquets perdus : rapprocher l\'ESP32.';
+  else if (!a.bpm) msg.textContent = 'Pas de rythme fiable : vérifier les électrodes.';
+  else msg.textContent = 'Signal ECG détecté.';
+  if (a.bpm && a.peaks.length) {
+    const lastIdx = a.peaks[a.peaks.length - 1] + a.offset;
+    const age = (N - lastIdx) / FS;
+    if (age < 0.8 && lastIdx !== lastBeatShown) {
+      lastBeatShown = lastIdx;
+      $('heart').classList.add('beat'); setTimeout(() => $('heart').classList.remove('beat'), 120);
+    }
+  }
+}
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
